@@ -25,6 +25,7 @@ CLI options:
 import multiprocessing
 import os
 import sys
+from pathlib import Path
 
 
 def _handle_version_flag() -> None:
@@ -46,6 +47,128 @@ def _handle_version_flag() -> None:
 
         print(get_version(), flush=True)
         sys.exit(0)
+
+
+def _handle_upgrade_flag() -> None:
+    """Handle --upgrade flag before any other initialization.
+
+    Checks for updates and performs upgrade if available.
+    Must run before heavy module imports to keep CLI responsive.
+
+    Note: This is handled after version flag, before normal startup flow.
+    """
+    if "--upgrade" not in sys.argv:
+        return
+
+    # Setup upgrade logging first
+    log_dir = Path.home() / ".wegent-executor" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    import logging
+    from logging.handlers import RotatingFileHandler
+
+    # Use 'updater' logger name to match UpdaterService and ProcessManager
+    upgrade_logger = logging.getLogger("updater")
+    upgrade_logger.setLevel(logging.DEBUG)
+
+    # Clear existing handlers and always set up fresh
+    upgrade_logger.handlers.clear()
+    if True:  # Always set up handlers
+        log_file = log_dir / "upgrade.log"
+        handler = RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8"
+        )
+        formatter = logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        handler.setFormatter(formatter)
+        upgrade_logger.addHandler(handler)
+
+        # Console handler for user feedback
+        console = logging.StreamHandler()
+        console.setLevel(logging.INFO)
+        console.setFormatter(formatter)
+        upgrade_logger.addHandler(console)
+
+    # Import update service only when needed
+    import asyncio
+
+    from executor.services.updater.process_manager import ProcessManager
+    from executor.services.updater.updater_service import UpdaterService
+    from executor.version import get_version
+
+    # Check for auto-confirm flag (-y or --yes)
+    auto_confirm = "-y" in sys.argv or "--yes" in sys.argv
+
+    # Load device config to get update configuration
+    from executor.config.device_config import get_config_path_from_args, load_device_config
+
+    config_path = get_config_path_from_args()
+    device_config = load_device_config(config_path)
+
+    print(f"wegent-executor v{get_version()}")
+    print()
+
+    # Check if executor is currently running (for auto-restart)
+    pm = ProcessManager()
+    running_info = pm.was_running()
+
+    try:
+        # Create updater service with update config
+        service = UpdaterService(
+            update_config=device_config.update,
+            auto_confirm=auto_confirm
+        )
+        result = asyncio.run(service.check_and_update())
+
+        if result.success:
+            if result.already_latest:
+                print("Already running the latest version")
+                sys.exit(0)
+            else:
+                print()
+                print("Update complete!")
+                print()
+
+                # Try to auto-restart if executor was running
+                if running_info:
+                    print("Restarting executor...")
+
+                    # First, terminate the old executor process
+                    if running_info.pid != os.getpid():
+                        print(f"Stopping old executor (pid={running_info.pid})...")
+                        pm.terminate_process(running_info.pid)
+
+                    # Then start new executor
+                    if pm.restart_executor():
+                        print("Executor restarted successfully")
+                        sys.exit(0)
+                    else:
+                        print("Failed to auto-restart executor")
+                        print()
+                        print("Please restart manually:")
+                        print("  wegent-executor")
+                        print()
+                        sys.exit(1)
+                else:
+                    print("Please restart the executor:")
+                    print("  wegent-executor")
+                    print()
+                    sys.exit(0)
+        else:
+            print(f"Update failed: {result.error}")
+            sys.exit(1)
+    except KeyboardInterrupt:
+        print()
+        print("Update cancelled by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        sys.exit(1)
 
 
 # Required for PyInstaller on macOS/Windows to prevent infinite fork
@@ -83,6 +206,9 @@ def main() -> None:
     """
     # Handle version flag first (before any heavy initialization)
     _handle_version_flag()
+
+    # Handle upgrade flag second (before heavy imports)
+    _handle_upgrade_flag()
 
     from executor.config.device_config import (
         get_config_path_from_args,
